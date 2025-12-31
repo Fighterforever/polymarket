@@ -1,93 +1,104 @@
-# Polymarket two-leg bot backtester
+# Polymarket two-leg bot (backtest + live dry-run)
 
-Deterministic replay engine for the two-leg Polymarket strategy described in @the_smart_ape's thread (BTC 15-minute UP/DOWN). It focuses on capturing a sharp drop (Leg 1) and hedging when both sides are sufficiently cheap (Leg 2), using recorded best-ask snapshots instead of live trading.
+This repository contains both the original backtesting tools and a **safe-by-default** live trading harness for Polymarket's CLOB. The live bot streams best-ask updates for a binary market, waits for a sharp drop on one side (Leg 1), and immediately hedges with the opposite side (Leg 2) when the combined entry cost is below a configurable threshold.
 
-The goal is to make the logic transparent, tunable, and reproducible for parameter sweeps before wiring real trading APIs.
+- Default mode is **dry-run**; no orders are sent unless `enable_live_trading=True` _and_ `LIVE_TRADING=1` are set.
+- Rate limits: keep Gamma/Data API queries below official limits (this project uses websocket market data and minimal polling). Be polite with retries and exponential backoff when extending.
+- Secrets: never log your private key, secret, or passphrase.
 
-## Quick start
+## Layout
 
-### Run the sample backtest
+- `polymarketbot/config.py` — Pydantic settings for env-driven config and risk controls.
+- `polymarketbot/clients/` — wrappers for Polymarket CLOB (py-clob-client) and Gamma discovery APIs.
+- `polymarketbot/marketdata/wss_market.py` — websocket subscription with reconnect + best-ask cache.
+- `polymarketbot/execution/executor.py` — dry-run/live order executor with kill-switch and limits.
+- `polymarketbot/strategy/` — backtest (`base.py`) and live streaming (`live_two_leg.py`) strategies.
+- `polymarketbot/state/store.py` — SQLite persistence for bot state and events.
+- `polymarketbot/cli.py` — original backtest CLI.
+- `polymarketbot/cli_live.py` — live runner: `run`, `cancel-all`, `status`, `print-config`.
+- `scripts/setup_allowances.py` — optional placeholder for ERC20 approvals (inert unless edited and run).
+
+## Installation
 
 ```bash
-python -m polymarketbot.cli data/sample_snapshots.csv --shares 10 --sum-target 0.95 --move-pct 0.15 --window-min 2
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-Expected output (sample dataset executes one paired trade):
+## Environment & .env
+
+Create a `.env` in the repo root (values are optional unless you enable live trading):
 
 ```
-Starting balance: $1000.00
-Ending balance  : $1000.70
-Total profit    : $0.70
-ROI             : 0.07%
-
-Trade log:
-  round=round-1 side=up leg1=0.4200, leg2=0.5100 shares=10 profit=0.70 note=paired hedge executed
+CLOB_HOST=https://clob.polymarket.com
+CHAIN_ID=137
+PRIVATE_KEY=0x...
+FUNDER=0x...
+SIGNATURE_TYPE=eip712
+API_KEY= # optional if PRIVATE_KEY provided
+SECRET=
+PASSPHRASE=
+LIVE_TRADING=0
 ```
 
-### Run tests
+Two authentication paths:
+- Provide `PRIVATE_KEY` and the wrapper will derive/cache L2 API credentials (saved to `.polymarket_api_creds.json`, chmod 600).
+- Or provide `API_KEY/SECRET/PASSPHRASE` directly to skip derivation.
+
+## Running (dry-run)
+
+```bash
+python -m polymarketbot.cli_live run --market "btc"  # searches Gamma for the market, dry-run only
+```
+
+- The bot resolves token IDs via Gamma, subscribes to the CLOB websocket, and logs intended orders without posting.
+- Kill-switch: if the file at `kill_switch_file_path` exists (default `.polymarketbot_kill`), the bot cancels open orders (if any) and exits.
+
+## Enabling live trading (dangerous)
+
+1. Set `enable_live_trading=True` in your environment or `.env` (Pydantic setting).
+2. Set `LIVE_TRADING=1` as an explicit on-switch.
+3. Fund your wallet, configure allowances (see `scripts/setup_allowances.py` placeholder), and test on dry-run first.
+
+Only when both flags are set will the executor post orders. Market orders (default) or IOC limit orders are used to avoid resting orders; adjust `max_slippage` and `max_position_usd` in config to suit your risk.
+
+## Strategy parameters
+
+- `move_pct`: required drop within `drop_window_seconds` to trigger Leg 1 (best-ask based).
+- `sum_target`: execute Leg 2 when `leg1_price + opposite_best_ask <= sum_target`.
+- `window_minutes`: after this window, Leg 1 will no longer trigger.
+- `allow_incomplete_hedge`: if False (default), Leg 2 timeouts only log/alert and do not auto-sell.
+- `hedge_timeout_seconds`: time allowed after Leg 1 before triggering the timeout handler.
+- `allow_concurrent_trades`: keep a single active trade per market by default.
+
+## Risk controls
+
+- `max_position_usd`, `max_daily_trades`, `max_slippage` (enforced in executor where applicable).
+- Kill switch file check before every order.
+- Dry-run default to prevent accidental execution.
+
+## Tests
 
 ```bash
 python -m unittest discover -s tests
 ```
 
-## Strategy recap
+Includes backtest sanity checks, live strategy event simulation, and executor dry-run safety.
 
-- **Market context**: BTC 15-minute UP/DOWN market (binary outcome). A temporary mispricing often appears during violent moves.
-- **Leg 1 – drop capture**: In the opening window (default 2 minutes), watch for ≥`move_pct` price drop within `drop_window_seconds` (default 3s) on either side. Buy that side at best ask.
-- **Leg 2 – hedge trigger**: After Leg 1, continuously monitor the opposite side. When `leg1_price + opposite_ask ≤ sum_target`, buy the opposite side to lock in payout spread.
-- **Round rollovers**: Each set of snapshots represents a round. If the round ends before Leg 2 fires, Leg 1 is treated as a full loss (conservative worst-case assumption).
+## Limitations & notes
 
-## Parameters and how to tune
+- Websocket reconnect/backoff is implemented, but you should add monitoring and alerting before real deployment.
+- No GUI is provided; consider adding Prometheus or structured log aggregation.
+- Respect Polymarket/Gamma rate limits; throttle additional REST calls if you extend data fetching.
 
-| Flag | Meaning | Typical starting point |
-| --- | --- | --- |
-| `--shares` | Order size per leg (shares) | 10–50 depending on bankroll |
-| `--sum-target` | Max combined entry cost for Leg1 + Leg2 | 0.95 (conservative) |
-| `--move-pct` | Drop percentage within ~3s to open Leg1 | 0.15 for sharp moves; 0.01 is aggressive |
-| `--window-min` | Minutes after round start when Leg1 may trigger | 2 for open-volatility focus |
-| `drop_window_seconds` | Rolling window for drop detection (fixed to 3s in CLI; configurable in code) | 3 |
+## Example commands
 
-Tuning advice (mirrors the thread):
-- Conservative: higher `sum_target` (e.g., 0.95), higher `move_pct` (0.15), short `window_min` (2). Produced ~+86% ROI in the author’s recorded run (with conservative fees/spread assumptions).
-- Aggressive: lower `sum_target` (0.6), tiny `move_pct` (0.01), long `window_min` (15). Led to ~-50% ROI in a couple of days—parameter choice is decisive.
-
-## Snapshot format
-
-CSV headers (see `data/sample_snapshots.csv`):
-
-- `timestamp`: floating seconds (monotonic within a round; can be epoch or relative).
-- `round_slug`: unique ID per 15-minute round.
-- `seconds_remaining`: seconds left in the round at capture time (informational only).
-- `up_ask` / `down_ask`: best ask prices for the Up and Down contracts.
-
-Snapshots should be sorted by `(round_slug, timestamp)`. The loader sorts defensively, but pre-sorting helps reproducibility on large files.
-
-## File map
-
-- `polymarketbot/strategy.py` — two-leg loop with drop detection and hedge trigger.
-- `polymarketbot/backtest.py` — snapshot replay and ROI accounting per round.
-- `polymarketbot/cli.py` — CLI entrypoint for running backtests and printing trade logs.
-- `data/sample_snapshots.csv` — tiny dataset that executes one paired trade for demonstration.
-- `tests/test_backtester.py` — sanity check for the sample dataset output.
-
-## What this backtester **does not** model (yet)
-
-- Order book depth, partial fills, or volume constraints.
-- Latency, network jitter, queueing, or API rate limits.
-- Maker/taker fee tiers or dynamic fees; assumes deterministic fills at best ask.
-- Market impact of your own orders and adversarial bots reacting to your flow.
-- Sub-second microstructure; snapshots are typically ~1s cadence.
-
-These gaps mirror the caveats noted in the original thread. Treat the results as directional for parameter exploration, not as production PnL predictions.
-
-## Suggested optimizations / next steps
-
-- Add a recorder that persists websocket best-bid/ask to CSV/Parquet to build richer datasets.
-- Parameter grid search: sweep `sum_target`, `move_pct`, `window_min`, and position sizing to find stable regions.
-- Simulate slippage/fees: plug in fee models and book depth to stress-test thin markets.
-- Engineering hardening: timeouts, retries, rate-limit handling, and round rollover awareness when streaming live data.
-- Performance: port latency-sensitive pieces to Rust and/or place the service near Polymarket infra, as suggested in the source thread.
+- Backtest: `python -m polymarketbot.cli data/sample_snapshots.csv`
+- Live dry-run: `python -m polymarketbot.cli_live run --market "btc"`
+- Cancel open orders: `python -m polymarketbot.cli_live cancel-all`
+- Inspect stored state: `python -m polymarketbot.cli_live status`
 
 ## Disclaimer
 
-This repository is for research and parameter exploration only. Nothing here constitutes financial advice. Real-money trading on Polymarket (or any venue) carries significant risk.
+This code is provided for educational purposes. Trading involves significant risk. Use dry-run mode and small size in testing; you are responsible for safeguarding your keys and funds.
